@@ -1,0 +1,229 @@
+#TODO: Add Proxy Info
+$proxyhost = ""
+$proxyport = ""
+$proxy = "$proxyhost" + ":" + $proxyport
+$proxyurl = "http://" + $proxy
+$proxyuser = ""
+$proxypwd = ""
+
+# set up proxy credentials
+$secPasswd = ConvertTo-SecureString $proxypwd -AsPlainText -Force
+$credential = New-Object PSCredential($proxyuser, $secPasswd)
+
+function Get-InstalledApps
+{
+    if ([IntPtr]::Size -eq 4) {
+        $regpath = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    }
+    else {
+        $regpath = @(
+            'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+            'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+        )
+    }
+    Get-ItemProperty $regpath | where {$_.displayname -like $appToMatch} | Select-Object DisplayName, DisplayVersion
+}
+
+#////////////////////////////////////////////////////////////////////////////////
+#// Check for IIS
+#////////////////////////////////////////////////////////////////////////////////
+
+echo "Checking for IIS..."
+
+try {
+    # Check if IIS is installed
+    if ((Get-WindowsFeature Web-Server).InstallState -eq "Installed") {
+        echo "IIS is installed"
+    } 
+    else {
+        echo "IIS is not installed"
+        echo "Installing IIS..."
+        # Installing IIS including the Management Tools
+        Install-WindowsFeature -name Web-Server -IncludeManagementTools
+
+        #Confirm installation was sucessful
+        if ((Get-WindowsFeature Web-Server).InstallState -eq "Installed") {
+            echo "IIS install successful!"
+        }
+        else {
+            Write-Error "Error during install!"
+            exit 1
+        }
+    }
+
+    # Invoke a GET on the IIS default page and verify HTTP status code
+    if ((Invoke-WebRequest -Uri 'http://localhost/' -Method GET).StatusCode -eq 200)
+    {
+        echo "GET http://localhost/ StatusCode=200"
+    }
+    else {
+        echo "GET http://localhost/ StatusCode!=200"
+        exit 1
+    }
+}
+catch {
+    Write-Host $_.Exception.Message`n
+    Write-Error "Error Installing IIS"
+}
+
+#////////////////////////////////////////////////////////////////////////////////
+#// Setup Powershell Environment
+#////////////////////////////////////////////////////////////////////////////////
+
+try {
+    
+    echo "Installing Nuget Package Manager"
+    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Proxy $proxyurl -ProxyCredential $credential
+
+    if(!(Get-PSRepository "PSGallery")) {
+        
+        echo "Temporarily adding proxy"
+        # Recovering the PsGallery Repository behind a Corporate Proxy
+        [system.net.webrequest]::defaultwebproxy = new-object system.net.webproxy($proxyurl)
+        [system.net.webrequest]::defaultwebproxy.credentials = $credential
+        [system.net.webrequest]::defaultwebproxy.BypassProxyOnLocal = $true
+
+        echo "Installing PSGallery"
+        Register-PSRepository -Default
+        
+        if (!(Get-Module "AWSPowerShell")) {
+            #https://docs.amazonaws.cn/powershell/latest/userguide/pstools-getting-set-up.html
+            echo "Installing module AWSPowerShell..."
+            Install-Module -Name AWSPowerShell -Confirm:$False -force -Scope CurrentUser
+        }
+
+        echo "Removing proxy"
+        [system.net.webrequest]::defaultwebproxy = [System.Net.WebRequest]::GetSystemWebProxy()
+    }
+}
+catch {
+    Write-Host $_.Exception.Message`n
+    Write-Error "Error Setting Up Powershell."
+}
+
+# ###################################################################
+# Add proxy - Proxy info will be injected from the template_file
+# ###################################################################
+
+if($proxy) {
+    echo "Setting up proxy..."
+    $bypassList = "*.yoursite.com"
+
+    # Set up OS-level proxy with netsh
+    netsh winhttp set proxy proxy-server=$proxy bypass-list=$bypassList
+
+    # Setting Internet Explorer proxy settings for AWS cmdlets. Lots of cmdlets don't refert to `netsh`
+    function Set-IE-Proxy($_proxy, $_bypassUrls){
+        $proxyBytes = [system.Text.Encoding]::ASCII.GetBytes($_proxy)
+        $bypassBytes = [system.Text.Encoding]::ASCII.GetBytes($_bypassUrls)
+        $defaultConnectionSettings = [byte[]]@(@(70,0,0,0,0,0,0,0,11,0,0,0,$proxyBytes.Length,0,0,0)+$proxyBytes+@($bypassBytes.Length,0,0,0)+$bypassBytes+ @(1..36 | % {0}))
+        $registryPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+        Set-ItemProperty -Path $registryPath -Name ProxyServer -Value $_proxy
+        Set-ItemProperty -Path $registryPath -Name ProxyEnable -Value 1
+        Set-ItemProperty -Path "$registryPath\Connections" -Name DefaultConnectionSettings -Value $defaultConnectionSettings
+        netsh winhttp set proxy $_proxy bypass-list=$_bypassUrls
+    }
+
+    Set-IE-Proxy $proxy $bypassList
+
+    # Add proxy credentials to Windows Credentials
+    try {
+
+        if(!(Get-PSRepository "PSGallery")) {
+            Register-PSRepository -Name "PSGallery" –SourceLocation "https://www.powershellgallery.com/api/v2/" -InstallationPolicy Trusted
+        }
+
+        if (!(Get-Module "CredentialManager")) {
+            # install nuget
+            Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Proxy $proxyurl -ProxyCredential $credential
+            echo "CredentialManager Module does not exist. Installing now."
+            Install-Module CredentialManager -Confirm:$False -force -Scope CurrentUser
+        }
+
+        # save credentials to Windows Credentials
+        New-StoredCredential -Target $proxyhost -Username $proxyuser -Pass $proxypwd -Persist ENTERPRISE
+    }
+    catch {
+        Write-Host $_.Exception.Message`n
+        Write-Error "Error adding proxy credentials to Windows Credentials"
+    }
+
+    # invoke web request
+    $Test1 = Invoke-WebRequest -URI 'http://www.google.com' -Proxy $proxyurl -ProxyCredential $credential -UseBasicParsing
+    if ($Test1.StatusCode -eq "200") {
+        echo "WebRequest status:200"
+    }
+    else {
+        echo "WebRequest error"
+        exit 1
+    }
+}
+else{
+    echo "No Proxy Info Specified. Proxy not set."
+}
+
+$tempdir = "C:\installs\"
+
+
+try {
+    #////////////////////////////////////////////////////////////////////////////////
+    #// Check for Microsoft Visual C++
+    #////////////////////////////////////////////////////////////////////////////////
+
+    echo "Checking for Microsoft Visual C++..."
+
+    $appToMatch = '*Microsoft Visual C++*'
+    $vccInstallFile = $tempdir + "vcredist_x64.exe"
+
+    if (-Not (Get-Item $tempdir)) { New-Item -ItemType dir $tempdir } 
+
+    $result = Get-InstalledApps | where {$_.DisplayName -like $appToMatch}
+
+    # If VC++ is not installed, install it.
+    If ($result -eq $null) {
+        echo "Installing Microsoft Visual C++"
+        $vccSource = "https://download.microsoft.com/download/3/2/2/3224B87F-CFA0-4E70-BDA3-3DE650EFEBA5/vcredist_x64.exe"
+        Invoke-WebRequest -Uri $vccSource -OutFile $vccInstallFile -Proxy $proxyurl -ProxyCredential $credential -UseBasicParsing
+        
+        $vccInstallResult = Start-Process -FilePath $vccInstallFile -ArgumentList "/quiet" -Passthru
+        if ($vccInstallResult.ExitCode -eq 0)
+        {
+            echo "Microsoft Visual C++ installed successfully"
+        }
+    }
+
+}
+catch {
+    Write-Host $_.Exception.Message`n
+    Write-Error "Error Installing Microsoft Visual C++"
+}
+
+#////////////////////////////////////////////////////////////////////////////////
+#// Set up AWS Credentials
+#////////////////////////////////////////////////////////////////////////////////
+Set-ExecutionPolicy Unrestricted -Force -Scope LocalMachine
+
+echo "Retrieving AWS meta-data..."
+$request = 'http://169.254.169.254/latest/meta-data/iam/security-credentials/role_ec2'
+$awsMeta = Invoke-WebRequest $request -UseBasicParsing | ConvertFrom-Json
+
+$defaultUserPath = "C:\Users\Default\"
+$awsDir = $defaultUserPath + ".aws"
+if (-Not (Get-Item $awsDir)) { 
+    echo "Creating AWS Credentials File"
+    # Create AWS Credentials File
+    cd $defaultUserPath
+    mkdir ".aws"
+    cd ".aws"
+    echo [default] "aws_access_key_id = $($awsMeta.AccessKeyId)" "aws_secret_access_key = $($awsMeta.SecretAccessKey)" > credentials
+    Start-Sleep -Seconds 1.5 #allow time for the AWS credentials file to be created
+} 
+
+#////////////////////////////////////////////////////////////////////////////////
+#// Download File from S3
+#////////////////////////////////////////////////////////////////////////////////
+echo "Downloading file..."    
+$tempdir = "C:\installs\"
+$installFile = $tempdir + "Setup.exe"
+$s3bucket = "my-aws-bucketname"
+Read-S3Object -BucketName $s3bucket -Key Setup.exe -File $installFile
